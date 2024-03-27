@@ -1,0 +1,142 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  
+  SAM Template for documentation chatbot serverless application
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Handler: main.lambda_handler
+    Architectures:
+      - arm64
+    Tracing: Active
+    Environment:
+      Variables:
+        LOG_LEVEL: INFO
+    Layers:
+      - !Sub arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPythonV2-Arm64:37
+
+Parameters:
+  OpensearchURL:
+    Type: String
+
+Resources:
+  DocumentBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-${AWS::Region}-${AWS::AccountId}"
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Queue: !GetAtt EmbeddingQueue.Arn
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - "*"
+            AllowedMethods:
+              - GET
+              - PUT
+              - HEAD
+              - POST
+              - DELETE
+            AllowedOrigins:
+              - "*"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  DocumentBucketPolicy:
+    Type: "AWS::S3::BucketPolicy"
+    Properties:
+      PolicyDocument:
+        Id: EnforceHttpsPolicy
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnforceHttpsSid
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "arn:aws:s3:::${DocumentBucket}/*"
+              - !Sub "arn:aws:s3:::${DocumentBucket}"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+      Bucket: !Ref DocumentBucket
+
+  EmbeddingQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      VisibilityTimeout: 180
+      MessageRetentionPeriod: 3600
+
+  EmbeddingQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref EmbeddingQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Id: SecureTransportPolicy
+        Statement:
+            Effect: Allow
+            Principal:
+              Service: "s3.amazonaws.com"
+            Action:
+              - "sqs:SendMessage"
+            Resource: !GetAtt EmbeddingQueue.Arn
+
+  GenerateEmbeddingsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/generate_embeddings/
+      Timeout: 180
+      MemorySize: 2048
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !GetAtt EmbeddingQueue.QueueName
+        - S3CrudPolicy:
+            BucketName: !Ref DocumentBucket
+        - Statement:
+            - Sid: "BedrockScopedAccess"
+              Effect: "Allow"
+              Action: "bedrock:InvokeModel"
+              Resource: "arn:aws:bedrock:*::foundation-model/amazon.titan-embed-text-v1"
+      Environment:
+        Variables:
+          OPENSEARCH_URL: !Ref OpensearchURL
+          BUCKET: !Ref DocumentBucket
+      Events:
+        EmbeddingQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt EmbeddingQueue.Arn
+            BatchSize: 1
+  GenerateResponseStreaming:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/generate_response_streaming
+      Handler: index.handler
+      Runtime: nodejs18.x
+      Timeout: 30
+      MemorySize: 256
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: 'bedrock:*'
+              Resource: '*'
+      Environment:
+        Variables:
+          OPENSEARCH_URL: !Ref OpensearchURL
+  GenerateResponseStreamingInvocationURL:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !Ref GenerateResponseStreaming
+      AuthType: AWS_IAM
+      InvokeMode: RESPONSE_STREAM
+
